@@ -1,0 +1,5 @@
+# Build for the CPU this machine has (AVX2 etc.), so the compiler can vectorise the NNUE
+# loops. The resulting binary will not run on older CPUs; delete this file to build a
+# portable binary.
+[build]
+rustflags = ["-C", "target-cpu=native"]

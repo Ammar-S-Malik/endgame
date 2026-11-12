@@ -1,0 +1,6 @@
+numpy
+# PyTorch must be a CUDA build to use the GPU. A plain "pip install torch" can give a
+# CPU-only build on Windows. RTX 50-series cards need a CUDA 12.8 (or newer) build:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# The selector at https://pytorch.org/get-started/locally/ gives the current command.
+torch

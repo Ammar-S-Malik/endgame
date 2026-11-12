@@ -1,0 +1,405 @@
+//! NNUE trainer: fits the 768 -> H -> 1 network on positions from `datagen`.
+//!
+//! usage: trainer --data a.txt,b.txt --out net.nnue [--epochs 30] [--batch 16384]
+//!                [--lr 0.001] [--lambda 0.75] [--threads 2] [--seed 1] [--init old.nnue]
+//!
+//! Loss: mean squared error between sigmoid(network output) and
+//!   target = lambda * sigmoid(search score / 400) + (1 - lambda) * game result,
+//! all from the side to move's point of view. Optimiser: Adam with cosine learning-rate decay.
+
+use endgame::nnue::{self, Net, H, INPUTS, QA, QB, SCALE};
+use std::fs;
+use std::time::Instant;
+
+const K: f32 = SCALE as f32;
+
+fn sigmoid(x: f32) -> f32 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn uniform(&mut self) -> f32 {
+        (self.next() >> 40) as f32 / (1u64 << 24) as f32 // [0, 1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Data
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct Data {
+    codes: Vec<u8>,
+    squares: Vec<u8>,
+    offsets: Vec<u32>, // start of each position's pieces; len = positions + 1
+    stm: Vec<u8>,
+    target: Vec<f32>,
+}
+
+impl Data {
+    fn len(&self) -> usize {
+        self.stm.len()
+    }
+    fn pieces(&self, i: usize) -> (&[u8], &[u8]) {
+        let (a, b) = (self.offsets[i] as usize, self.offsets[i + 1] as usize);
+        (&self.codes[a..b], &self.squares[a..b])
+    }
+}
+
+fn load(paths: &[String], lambda: f32) -> Data {
+    let mut d = Data::default();
+    d.offsets.push(0);
+    const PIECES: &str = "PNBRQKpnbrqk";
+    for path in paths {
+        let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
+        for line in text.lines() {
+            let mut parts = line.split(';');
+            let (Some(fen), Some(score), Some(result)) = (parts.next(), parts.next(), parts.next()) else {
+                continue;
+            };
+            let (Ok(score), Ok(result)) = (score.parse::<f32>(), result.parse::<f32>()) else {
+                continue;
+            };
+            let mut fields = fen.split(' ');
+            let placement = fields.next().unwrap();
+            let white_to_move = fields.next() == Some("w");
+            let start = d.codes.len();
+            let (mut rank, mut file) = (7i32, 0i32);
+            for c in placement.chars() {
+                match c {
+                    '/' => {
+                        rank -= 1;
+                        file = 0;
+                    }
+                    '1'..='8' => file += c.to_digit(10).unwrap() as i32,
+                    _ => {
+                        let code = PIECES.find(c).expect("bad piece") as u8;
+                        d.codes.push(code);
+                        d.squares.push((rank * 8 + file) as u8);
+                        file += 1;
+                    }
+                }
+            }
+            if d.codes.len() == start {
+                continue;
+            }
+            // Everything from the side to move's point of view.
+            let (s, r) = if white_to_move { (score, result) } else { (-score, 1.0 - result) };
+            d.target.push(lambda * sigmoid(s / K) + (1.0 - lambda) * r);
+            d.stm.push(if white_to_move { 0 } else { 1 });
+            d.offsets.push(d.codes.len() as u32);
+        }
+    }
+    d
+}
+
+// ---------------------------------------------------------------------------
+// Model
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct Params {
+    ft_w: Vec<f32>, // INPUTS * H
+    ft_b: Vec<f32>, // H
+    out_w: Vec<f32>, // 2 * H
+    out_b: f32,
+}
+
+impl Params {
+    fn zeros() -> Params {
+        Params { ft_w: vec![0.0; INPUTS * H], ft_b: vec![0.0; H], out_w: vec![0.0; 2 * H], out_b: 0.0 }
+    }
+    fn len(&self) -> usize {
+        INPUTS * H + H + 2 * H + 1
+    }
+}
+
+fn forward(p: &Params, codes: &[u8], squares: &[u8], stm: usize, acc: &mut [[f32; H]; 2]) -> f32 {
+    acc[0].copy_from_slice(&p.ft_b);
+    acc[1].copy_from_slice(&p.ft_b);
+    for (&c, &sq) in codes.iter().zip(squares) {
+        for persp in 0..2 {
+            let row = &p.ft_w[nnue::feature(persp, c as usize, sq as usize) * H..][..H];
+            let a = &mut acc[persp];
+            for i in 0..H {
+                a[i] += row[i];
+            }
+        }
+    }
+    let mut out = p.out_b;
+    for i in 0..H {
+        out += p.out_w[i] * acc[stm][i].clamp(0.0, 1.0) + p.out_w[H + i] * acc[stm ^ 1][i].clamp(0.0, 1.0);
+    }
+    out
+}
+
+struct Grad {
+    ft_w: Vec<f32>,
+    ft_b: Vec<f32>,
+    out_w: Vec<f32>,
+    out_b: f32,
+    loss: f64,
+}
+
+impl Grad {
+    fn new() -> Grad {
+        Grad { ft_w: vec![0.0; INPUTS * H], ft_b: vec![0.0; H], out_w: vec![0.0; 2 * H], out_b: 0.0, loss: 0.0 }
+    }
+    fn clear(&mut self) {
+        self.ft_w.iter_mut().for_each(|x| *x = 0.0);
+        self.ft_b.iter_mut().for_each(|x| *x = 0.0);
+        self.out_w.iter_mut().for_each(|x| *x = 0.0);
+        self.out_b = 0.0;
+        self.loss = 0.0;
+    }
+}
+
+fn accumulate(g: &mut Grad, p: &Params, d: &Data, batch: &[u32]) {
+    let mut acc = [[0f32; H]; 2];
+    for &idx in batch {
+        let i = idx as usize;
+        let (codes, squares) = d.pieces(i);
+        let stm = d.stm[i] as usize;
+        let out = forward(p, codes, squares, stm, &mut acc);
+        let pred = sigmoid(out);
+        let err = pred - d.target[i];
+        g.loss += (err * err) as f64;
+        let dout = 2.0 * err * pred * (1.0 - pred);
+
+        g.out_b += dout;
+        let mut d_acc = [[0f32; H]; 2];
+        for k in 0..H {
+            let (a_us, a_them) = (acc[stm][k], acc[stm ^ 1][k]);
+            g.out_w[k] += dout * a_us.clamp(0.0, 1.0);
+            g.out_w[H + k] += dout * a_them.clamp(0.0, 1.0);
+            if a_us > 0.0 && a_us < 1.0 {
+                d_acc[stm][k] = dout * p.out_w[k];
+            }
+            if a_them > 0.0 && a_them < 1.0 {
+                d_acc[stm ^ 1][k] = dout * p.out_w[H + k];
+            }
+        }
+        for persp in 0..2 {
+            for k in 0..H {
+                g.ft_b[k] += d_acc[persp][k];
+            }
+        }
+        for (&c, &sq) in codes.iter().zip(squares) {
+            for persp in 0..2 {
+                let row = &mut g.ft_w[nnue::feature(persp, c as usize, sq as usize) * H..][..H];
+                for k in 0..H {
+                    row[k] += d_acc[persp][k];
+                }
+            }
+        }
+    }
+}
+
+fn eval_loss(p: &Params, d: &Data, range: std::ops::Range<usize>) -> f64 {
+    let mut acc = [[0f32; H]; 2];
+    let mut sum = 0.0f64;
+    for i in range.clone() {
+        let (codes, squares) = d.pieces(i);
+        let out = forward(p, codes, squares, d.stm[i] as usize, &mut acc);
+        let e = sigmoid(out) - d.target[i];
+        sum += (e * e) as f64;
+    }
+    sum / range.len().max(1) as f64
+}
+
+// ---------------------------------------------------------------------------
+// Export and integer-network check
+// ---------------------------------------------------------------------------
+
+fn quantise(v: f32, scale: i32) -> i16 {
+    (v * scale as f32).round().clamp(-32767.0, 32767.0) as i16
+}
+
+fn export(p: &Params) -> Net {
+    let mut ft_b = [0i16; H];
+    for i in 0..H {
+        ft_b[i] = quantise(p.ft_b[i], QA);
+    }
+    let mut out_w = [0i16; 2 * H];
+    for i in 0..2 * H {
+        out_w[i] = quantise(p.out_w[i], QB);
+    }
+    Net {
+        ft_w: p.ft_w.iter().map(|&w| quantise(w, QA)).collect(),
+        ft_b,
+        out_w,
+        out_b: (p.out_b * (QA * QB) as f32).round() as i32,
+    }
+}
+
+/// Validation loss of the integer network, to prove the export matches the float model.
+fn quantised_loss(net: &Net, d: &Data, range: std::ops::Range<usize>) -> f64 {
+    let mut sum = 0.0f64;
+    for i in range.clone() {
+        let (codes, squares) = d.pieces(i);
+        let mut acc = [net.ft_b; 2];
+        for (&c, &sq) in codes.iter().zip(squares) {
+            net.update(&mut acc, c as usize, sq as usize, true);
+        }
+        let cp = net.evaluate(&acc, d.stm[i] as usize);
+        let e = sigmoid(cp as f32 / K) - d.target[i];
+        sum += (e * e) as f64;
+    }
+    sum / range.len().max(1) as f64
+}
+
+fn main() {
+    let mut data_paths: Vec<String> = Vec::new();
+    let mut out = String::from("net.nnue");
+    let (mut epochs, mut batch, mut lr, mut lambda, mut threads, mut seed) = (30usize, 16384usize, 1e-3f32, 0.75f32, 2usize, 1u64);
+    let mut init: Option<String> = None;
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        let v = args.get(i + 1).cloned().unwrap_or_default();
+        match args[i].as_str() {
+            "--data" => data_paths = v.split(',').map(String::from).collect(),
+            "--out" => out = v,
+            "--epochs" => epochs = v.parse().unwrap(),
+            "--batch" => batch = v.parse().unwrap(),
+            "--lr" => lr = v.parse().unwrap(),
+            "--lambda" => lambda = v.parse().unwrap(),
+            "--threads" => threads = v.parse().unwrap(),
+            "--seed" => seed = v.parse().unwrap(),
+            "--init" => init = Some(v),
+            other => panic!("unknown argument {other}"),
+        }
+        i += 2;
+    }
+    assert!(!data_paths.is_empty(), "--data is required");
+
+    let t0 = Instant::now();
+    let data = load(&data_paths, lambda);
+    let n = data.len();
+    let val_n = (n / 50).clamp(1, 100_000);
+    let train_n = n - val_n;
+    eprintln!("loaded {n} positions ({train_n} train, {val_n} validation) in {:.1}s", t0.elapsed().as_secs_f64());
+    assert!(train_n >= batch, "not enough data for one batch");
+
+    // Initialise.
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut params = Params::zeros();
+    if let Some(path) = &init {
+        let net = Net::from_bytes(&fs::read(path).unwrap()).unwrap();
+        for (i, w) in net.ft_w.iter().enumerate() {
+            params.ft_w[i] = *w as f32 / QA as f32;
+        }
+        for i in 0..H {
+            params.ft_b[i] = net.ft_b[i] as f32 / QA as f32;
+        }
+        for i in 0..2 * H {
+            params.out_w[i] = net.out_w[i] as f32 / QB as f32;
+        }
+        params.out_b = net.out_b as f32 / (QA * QB) as f32;
+        eprintln!("initialised from {path}");
+    } else {
+        for w in params.ft_w.iter_mut() {
+            *w = (rng.uniform() - 0.5) * 0.2;
+        }
+        for w in params.out_w.iter_mut() {
+            *w = (rng.uniform() - 0.5) * 0.2;
+        }
+    }
+
+    // Adam state.
+    let total = params.len();
+    let (mut m, mut v) = (vec![0f32; total], vec![0f32; total]);
+    let (b1, b2, eps) = (0.9f32, 0.999f32, 1e-8f32);
+    let mut step = 0i32;
+    let mut order: Vec<u32> = (0..train_n as u32).collect();
+    let mut grads: Vec<Grad> = (0..threads).map(|_| Grad::new()).collect();
+
+    eprintln!("initial validation loss {:.5}", eval_loss(&params, &data, train_n..n));
+    for epoch in 0..epochs {
+        let epoch_start = Instant::now();
+        // Shuffle.
+        for i in (1..order.len()).rev() {
+            let j = (rng.next() % (i as u64 + 1)) as usize;
+            order.swap(i, j);
+        }
+        let cur_lr = lr * (0.02 + 0.98 * 0.5 * (1.0 + (std::f32::consts::PI * epoch as f32 / epochs as f32).cos()));
+        let mut epoch_loss = 0.0f64;
+        let mut seen = 0usize;
+        for chunk in order.chunks(batch) {
+            if chunk.len() < batch / 2 {
+                continue;
+            }
+            for g in grads.iter_mut() {
+                g.clear();
+            }
+            let per = (chunk.len() + threads - 1) / threads;
+            std::thread::scope(|s| {
+                for (g, part) in grads.iter_mut().zip(chunk.chunks(per)) {
+                    let (p, d) = (&params, &data);
+                    s.spawn(move || accumulate(g, p, d, part));
+                }
+            });
+            // Sum thread gradients into grads[0].
+            let (first, rest) = grads.split_first_mut().unwrap();
+            for g in rest.iter() {
+                for (a, b) in first.ft_w.iter_mut().zip(&g.ft_w) {
+                    *a += *b;
+                }
+                for k in 0..H {
+                    first.ft_b[k] += g.ft_b[k];
+                }
+                for k in 0..2 * H {
+                    first.out_w[k] += g.out_w[k];
+                }
+                first.out_b += g.out_b;
+                first.loss += g.loss;
+            }
+            epoch_loss += first.loss;
+            seen += chunk.len();
+
+            // Adam step (gradients averaged over the batch).
+            step += 1;
+            let inv = 1.0 / chunk.len() as f32;
+            let c1 = 1.0 - b1.powi(step);
+            let c2 = 1.0 - b2.powi(step);
+            let mut update = |idx: usize, grad: f32, w: &mut f32| {
+                let gr = grad * inv;
+                m[idx] = b1 * m[idx] + (1.0 - b1) * gr;
+                v[idx] = b2 * v[idx] + (1.0 - b2) * gr * gr;
+                *w -= cur_lr * (m[idx] / c1) / ((v[idx] / c2).sqrt() + eps);
+            };
+            for k in 0..INPUTS * H {
+                update(k, first.ft_w[k], &mut params.ft_w[k]);
+            }
+            for k in 0..H {
+                update(INPUTS * H + k, first.ft_b[k], &mut params.ft_b[k]);
+            }
+            for k in 0..2 * H {
+                update(INPUTS * H + H + k, first.out_w[k], &mut params.out_w[k]);
+            }
+            update(total - 1, first.out_b, &mut params.out_b);
+        }
+        eprintln!(
+            "epoch {:>3}/{epochs}  lr {:.5}  train loss {:.5}  val loss {:.5}  ({:.1}s)",
+            epoch + 1,
+            cur_lr,
+            epoch_loss / seen.max(1) as f64,
+            eval_loss(&params, &data, train_n..n),
+            epoch_start.elapsed().as_secs_f64()
+        );
+    }
+
+    let net = export(&params);
+    let float_loss = eval_loss(&params, &data, train_n..n);
+    let int_loss = quantised_loss(&net, &data, train_n..n);
+    eprintln!("validation loss: float {float_loss:.5}, quantised integer network {int_loss:.5}");
+    fs::write(&out, net.to_bytes()).expect("write network");
+    eprintln!("wrote {out} ({} bytes) in {:.0}s total", net.to_bytes().len(), t0.elapsed().as_secs_f64());
+}

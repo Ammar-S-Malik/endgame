@@ -148,6 +148,9 @@ pub fn scratch_sums(b: &Board) -> (i32, i32, i32) {
 /// Static evaluation in centipawns from the side to move's point of view.
 #[inline]
 pub fn evaluate(b: &Board) -> i32 {
+    if let Some(net) = crate::nnue::net() {
+        return net.evaluate(&b.acc, b.side, (b.occ[0] | b.occ[1]).count_ones());
+    }
     let phase = b.phase.min(24);
     let score = (b.mg * phase + b.eg * (24 - phase)) / 24;
     if b.side == WHITE {

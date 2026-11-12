@@ -2,7 +2,8 @@
 //! incremental Zobrist hashing, and make/undo of moves.
 
 use crate::attacks::*;
-use crate::eval::{scratch_sums, EG_TABLE, MG_TABLE, PHASE_WEIGHT};
+use crate::eval::{scratch_sums, EG_TABLE, MG_TABLE, PHASE_WEIGHT, VALUE};
+use crate::nnue;
 use crate::types::*;
 use std::sync::OnceLock;
 
@@ -76,6 +77,8 @@ struct Undo {
     ep: u8,
     halfmove: u32,
     hash: u64,
+    /// NNUE accumulators before the move; restored on undo.
+    acc: nnue::Accumulators,
 }
 
 #[derive(Clone)]
@@ -94,6 +97,8 @@ pub struct Board {
     pub mg: i32,
     pub eg: i32,
     pub phase: i32,
+    /// NNUE accumulators (both perspectives); only maintained while a network is loaded.
+    pub acc: nnue::Accumulators,
     undo: Vec<Undo>,
     /// Hash of every position since the start of the game (current one last).
     keys: Vec<u64>,
@@ -114,6 +119,7 @@ impl Board {
             mg: 0,
             eg: 0,
             phase: 0,
+            acc: [[0; nnue::H]; 2],
             undo: Vec::with_capacity(512),
             keys: Vec::with_capacity(512),
         }
@@ -183,6 +189,7 @@ impl Board {
         b.mg = mg;
         b.eg = eg;
         b.phase = phase;
+        b.refresh_nnue();
         b.keys.push(b.hash);
         Ok(b)
     }
@@ -252,6 +259,88 @@ impl Board {
         s.push_str("  a b c d e f g h\n");
         s.push_str(&format!("FEN: {}\n", self.to_fen()));
         s
+    }
+
+    /// All pieces (of both colours) that attack `sq`, given an occupancy.
+    #[inline]
+    pub fn attackers_to(&self, sq: usize, occ: Bb) -> Bb {
+        let t = tables();
+        let both = |pt: usize| self.bb[WHITE][pt] | self.bb[BLACK][pt];
+        (t.pawn[BLACK][sq] & self.bb[WHITE][PAWN])
+            | (t.pawn[WHITE][sq] & self.bb[BLACK][PAWN])
+            | (t.knight[sq] & both(KNIGHT))
+            | (t.king[sq] & both(KING))
+            | (bishop_attacks(sq, occ) & (both(BISHOP) | both(QUEEN)))
+            | (rook_attacks(sq, occ) & (both(ROOK) | both(QUEEN)))
+    }
+
+    /// Static exchange evaluation: does playing `m` win at least `threshold` centipawns of
+    /// material once all the captures on that square are played out? (Pins are ignored.)
+    pub fn see_ge(&self, m: Move, threshold: i32) -> bool {
+        let flags = m.flags();
+        if m.is_promo() || flags == FLAG_EP || flags == FLAG_KCASTLE || flags == FLAG_QCASTLE {
+            return threshold <= 0;
+        }
+        let (from, to) = (m.from(), m.to());
+        let victim = if self.mailbox[to] == EMPTY { 0 } else { VALUE[(self.mailbox[to] % 6) as usize] };
+        let mut swap = victim - threshold;
+        if swap < 0 {
+            return false;
+        }
+        let mut attacker = (self.mailbox[from] % 6) as usize;
+        swap = VALUE[attacker] - swap;
+        if swap <= 0 {
+            return true;
+        }
+        let mut occ = (self.occ[0] | self.occ[1]) ^ (1u64 << from) ^ (1u64 << to);
+        let mut stm = self.side;
+        let mut attackers = self.attackers_to(to, occ);
+        let both = |pt: usize| self.bb[WHITE][pt] | self.bb[BLACK][pt];
+        let mut res = true;
+        loop {
+            stm ^= 1;
+            attackers &= occ;
+            let mine = attackers & self.occ[stm];
+            if mine == 0 {
+                break;
+            }
+            res = !res;
+            // Least valuable attacker first.
+            let mut found = KING;
+            let mut bb = 0u64;
+            for pt in PAWN..=KING {
+                let c = mine & self.bb[stm][pt];
+                if c != 0 {
+                    found = pt;
+                    bb = c;
+                    break;
+                }
+            }
+            if found == KING {
+                // The king can only capture if the other side has no attackers left.
+                return if attackers & !self.occ[stm] != 0 { !res } else { res };
+            }
+            attacker = found;
+            swap = VALUE[attacker] - swap;
+            if swap < res as i32 {
+                break;
+            }
+            occ ^= bb & bb.wrapping_neg();
+            if matches!(attacker, PAWN | BISHOP | QUEEN) {
+                attackers |= bishop_attacks(to, occ) & (both(BISHOP) | both(QUEEN));
+            }
+            if matches!(attacker, ROOK | QUEEN) {
+                attackers |= rook_attacks(to, occ) & (both(ROOK) | both(QUEEN));
+            }
+        }
+        res
+    }
+
+    /// Rebuild the NNUE accumulators from the current pieces (no-op without a loaded network).
+    pub fn refresh_nnue(&mut self) {
+        if let Some(net) = nnue::net() {
+            self.acc = net.refresh(self);
+        }
     }
 
     /// Recompute the hash from scratch (used at setup and in tests).
@@ -400,6 +489,13 @@ impl Board {
             EMPTY
         };
 
+        // Every piece this move adds or removes, as (piece code, square, added): used to update
+        // the NNUE accumulators once the whole move has been played. At most 5 (capture,
+        // move, and a castling rook).
+        let mut changes = [(0usize, 0usize, false); 5];
+        let mut nch = 0usize;
+        let old_ksq = [self.king_sq(WHITE), self.king_sq(BLACK)];
+
         self.undo.push(Undo {
             mv: m,
             captured,
@@ -407,6 +503,7 @@ impl Board {
             ep: self.ep,
             halfmove: self.halfmove,
             hash: self.hash,
+            acc: self.acc,
         });
 
         // Clear the old en passant square from the hash.
@@ -418,22 +515,36 @@ impl Board {
         // Remove the captured piece.
         if flags == FLAG_EP {
             self.remove_piece(them, PAWN, ep_cap_sq);
+            changes[nch] = (them * 6 + PAWN, ep_cap_sq, false);
+            nch += 1;
         } else if captured != EMPTY {
             self.remove_piece(them, (captured % 6) as usize, to);
+            changes[nch] = (captured as usize, to, false);
+            nch += 1;
         }
 
         // Move the piece (promoting if needed).
         self.remove_piece(us, pt, from);
+        changes[nch] = (us * 6 + pt, from, false);
+        nch += 1;
         let placed = if m.is_promo() { m.promo_piece() } else { pt };
         self.add_piece(us, placed, to);
+        changes[nch] = (us * 6 + placed, to, true);
+        nch += 1;
 
         // Move the rook when castling.
         if flags == FLAG_KCASTLE {
             self.remove_piece(us, ROOK, to + 1);
             self.add_piece(us, ROOK, to - 1);
+            changes[nch] = (us * 6 + ROOK, to + 1, false);
+            changes[nch + 1] = (us * 6 + ROOK, to - 1, true);
+            nch += 2;
         } else if flags == FLAG_QCASTLE {
             self.remove_piece(us, ROOK, to - 2);
             self.add_piece(us, ROOK, to + 1);
+            changes[nch] = (us * 6 + ROOK, to - 2, false);
+            changes[nch + 1] = (us * 6 + ROOK, to + 1, true);
+            nch += 2;
         }
 
         self.halfmove = if pt == PAWN || captured != EMPTY { 0 } else { self.halfmove + 1 };
@@ -452,6 +563,11 @@ impl Board {
         self.hash ^= z.side;
         if us == BLACK {
             self.fullmove += 1;
+        }
+        if let Some(net) = nnue::net() {
+            let mut acc = self.acc;
+            net.apply(&mut acc, self, &changes[..nch], old_ksq);
+            self.acc = acc;
         }
         self.keys.push(self.hash);
     }
@@ -492,6 +608,7 @@ impl Board {
         self.ep = u.ep;
         self.halfmove = u.halfmove;
         self.hash = u.hash;
+        self.acc = u.acc;
         if us == BLACK {
             self.fullmove -= 1;
         }
@@ -520,6 +637,7 @@ impl Board {
             ep: self.ep,
             halfmove: self.halfmove,
             hash: self.hash,
+            acc: self.acc,
         });
         if self.ep != NO_SQ {
             self.hash ^= z.ep[(self.ep % 8) as usize];

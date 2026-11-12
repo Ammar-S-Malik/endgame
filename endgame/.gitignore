@@ -1,0 +1,21 @@
+# build output
+/target
+
+# training data and caches (several GB; regenerate with datagen)
+data*.txt
+data*.txt.bin
+test.*.txt
+test.*.txt.bin
+test.nnue
+
+# experiment networks: only the embedded default network is tracked
+/net/*
+!/net/endgame-v2.nnue
+net64*.nnue
+net256.nnue
+net_kb*.nnue
+
+# old binaries and local scratch
+*.exe
+/backup_pre_upgrade
+/Claude outputs

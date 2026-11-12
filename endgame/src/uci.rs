@@ -116,7 +116,73 @@ fn run_bench(depth: i32, stop: &Arc<AtomicBool>) {
     println!("\n{total} nodes {ms} ms {} nps", total * 1000 / ms);
 }
 
+/// Random but roughly balanced opening for testing: `plies` random legal moves from the
+/// start position, rejected unless a shallow search says neither side is clearly better.
+fn gen_opening(plies: usize, seed: u64, endgame: bool, stop: &Arc<AtomicBool>) -> String {
+    let mut searcher = Searcher::new(stop.clone());
+    searcher.set_hash_mb(1);
+    for attempt in 0..200u64 {
+        let mut state = seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(attempt.wrapping_mul(0xD1B5_4A32_D192_ED03))
+            | 1;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut board = Board::startpos();
+        let mut moves = Vec::new();
+        let mut ok = true;
+        for _ in 0..plies {
+            let legal = legal_moves(&mut board);
+            if legal.is_empty() {
+                ok = false;
+                break;
+            }
+            let m = legal[(next() % legal.len() as u64) as usize];
+            moves.push(m.to_uci());
+            board.make_move(m);
+        }
+        if !ok || legal_moves(&mut board).is_empty() {
+            continue;
+        }
+        // Endgame starts: keep playing random moves, preferring captures, until little
+        // material is left.
+        if endgame {
+            for _ in 0..80 {
+                if (board.occ[0] | board.occ[1]).count_ones() <= 12 {
+                    break;
+                }
+                let legal = legal_moves(&mut board);
+                if legal.is_empty() {
+                    ok = false;
+                    break;
+                }
+                let caps: Vec<Move> = legal.iter().copied().filter(|m| m.is_capture()).collect();
+                let pool = if !caps.is_empty() && next() % 100 < 70 { &caps } else { &legal };
+                let m = pool[(next() % pool.len() as u64) as usize];
+                moves.push(m.to_uci());
+                board.make_move(m);
+            }
+            if !ok || (board.occ[0] | board.occ[1]).count_ones() > 14 || legal_moves(&mut board).is_empty() {
+                continue;
+            }
+        }
+        let r = searcher.search(&mut board, &Limits::fixed_depth(4), false);
+        if r.score.abs() <= if endgame { 150 } else { 80 } {
+            return moves.join(" ");
+        }
+    }
+    String::new()
+}
+
 pub fn run() {
+    // The engine ships with a network; `setoption name UseNNUE value false` switches it off.
+    if let Err(e) = crate::nnue::load_default() {
+        eprintln!("could not load the embedded network: {e}");
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<String>();
@@ -155,6 +221,11 @@ pub fn run() {
                 println!("id name Endgame {}", env!("CARGO_PKG_VERSION"));
                 println!("id author Ammar Malik");
                 println!("option name Hash type spin default 16 min 1 max 1024");
+                println!("option name EvalFile type string default <empty>");
+                println!("option name UseNNUE type check default true");
+                println!("option name Improving type check default true");
+                println!("option name ContHist type check default true");
+                println!("option name Singular type check default true");
                 println!("uciok");
             }
             "isready" => println!("readyok"),
@@ -162,10 +233,39 @@ pub fn run() {
                 // setoption name Hash value 64
                 let lower: Vec<String> = rest.iter().map(|t| t.to_lowercase()).collect();
                 if lower.first().map(String::as_str) == Some("name")
+                    && lower.get(1).map(String::as_str) == Some("usennue")
+                {
+                    if lower.get(3).map(String::as_str) == Some("false") {
+                        crate::nnue::disable();
+                    } else if let Err(e) = crate::nnue::load_default() {
+                        println!("info string could not load network: {e}");
+                    }
+                    board.refresh_nnue();
+                } else if lower.first().map(String::as_str) == Some("name")
+                    && lower.get(1).map(String::as_str) == Some("evalfile")
+                {
+                    // Keep the original case of the path.
+                    let path = rest.iter().skip_while(|t| t.to_lowercase() != "value").skip(1);
+                    let path = path.cloned().collect::<Vec<_>>().join(" ");
+                    if !path.is_empty() && path != "<empty>" {
+                        match crate::nnue::load_file(&path) {
+                            Ok(()) => {
+                                board.refresh_nnue();
+                                println!("info string loaded network {path}");
+                            }
+                            Err(e) => println!("info string could not load network: {e}"),
+                        }
+                    }
+                } else if lower.first().map(String::as_str) == Some("name")
                     && lower.get(1).map(String::as_str) == Some("hash")
                 {
                     if let Some(mb) = lower.get(3).and_then(|v| v.parse::<usize>().ok()) {
                         searcher.set_hash_mb(mb.clamp(1, 1024));
+                    }
+                } else if lower.first().map(String::as_str) == Some("name") {
+                    // Search feature switches (Improving, ContHist, Singular): "name X value true".
+                    if let (Some(n), Some(v)) = (lower.get(1), lower.get(3)) {
+                        searcher.set_flag(n.as_str(), v.as_str() == "true" || v.as_str() == "1");
                     }
                 }
             }
@@ -184,6 +284,13 @@ pub fn run() {
             // A `stop` that arrives while idle is consumed here.
             "stop" => stop.store(false, Ordering::SeqCst),
             "d" => print!("{}", board.display()),
+            // Non-standard helper for the match script: genopening <plies> <seed>
+            "genopening" => {
+                let plies = rest.first().and_then(|s| s.parse().ok()).unwrap_or(8);
+                let seed = rest.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+                let endgame = rest.get(2) == Some(&"endgame");
+                println!("opening {}", gen_opening(plies, seed, endgame, &stop));
+            }
             // Non-standard helper used by the match script to adjudicate games.
             "status" => {
                 let status = if legal_moves(&mut board).is_empty() {
